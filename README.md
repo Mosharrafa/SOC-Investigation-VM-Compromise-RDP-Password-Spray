@@ -581,25 +581,3 @@ DeviceNetworkEvents
 
 ---
 
-> *Investigation completed in a Microsoft cyber range environment using Microsoft Sentinel Advanced Hunting and MDE telemetry.*
-> *All screenshots in `/screenshots/` folder correspond to KQL query results from the live investigation.*
-
----
-
-## Screenshots Required
-
-> Add your actual KQL result screenshots to the `/screenshots/` folder with these filenames:
-
-```
-screenshots/
-├── flag_01_auth_analysis.png
-├── flag_02_compromised_account.png
-├── flag_03_malicious_binary.png
-├── flag_04_command_line.png
-├── flag_05_scheduled_task.png
-├── flag_06_defender_evasion.png
-├── flag_07_discovery.png
-├── flag_08_archive.png
-├── flag_09_c2.png
-└── flag_10_exfiltration.png
-```
