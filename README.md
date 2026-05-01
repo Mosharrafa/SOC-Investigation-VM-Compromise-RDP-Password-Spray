@@ -7,7 +7,8 @@
 [![MITRE](https://img.shields.io/badge/Framework-MITRE%20ATT%26CK-red)](https://attack.mitre.org/)
 [![Flags](https://img.shields.io/badge/Flags%20Identified-10%2F10-brightgreen)](https://github.com)
 
-![Intro Banner](screenshots/intro_banner.png)
+<img width="988" height="655" alt="image" src="https://github.com/user-attachments/assets/c9f6cab6-eb3f-42b1-a802-9f5b4490ef24" />
+
 
 ---
 
@@ -26,7 +27,6 @@
 
 ## Scenario
 
-![Scenario](screenshots/scenario.png)
 
 Suspicious RDP login activity was detected on a cloud-hosted Windows server. The SOC received an alert indicating multiple failed authentication attempts followed by a successful login from an external IP address. As the assigned analyst, the objective was to determine how the attacker got in, what they did once inside, and whether they still had access.
 
